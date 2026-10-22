@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""Native (no x86 binaries, no D-Bus) Aruba Onboard enrollment for UVG CAMPUS CENTRAL.
+
+Reimplements what HPE's onboard-cli/onboard-ui do, so it works on any
+architecture (aarch64/Asahi, x86_64, ...). Only needs python3, openssl and
+NetworkManager (nmcli).
+
+Flow (reverse engineered from the Aruba Onboard Linux client):
+  1. arubadp://.../provision?data=<b64 json {token, config_endpoint}>
+  2. GET  config_endpoint            (Authorization: Bearer <bootstrap token>)
+  3. POST token_endpoint             (X-CloudGuest-API-Key: <bootstrap token>)
+                                     -> access_token  (bootstrap token is single use!)
+  4. POST passpoint_endpoint         (X-CloudGuest-API-Key: <access_token>)
+                                     -> ssid, identity, server CA, est_endpoint, est_token
+  5. EST (RFC 7030): GET csrattrs / cacerts, POST simpleenroll with a PKCS#10 CSR
+     (Authorization: Bearer <est_token>) -> client certificate
+  6. Write ~/.aruba-onboard/* and create the NetworkManager profile.
+
+Usage:
+  aruba-native-enroll                      # reads link from ~/arubadp-link.txt
+  aruba-native-enroll 'arubadp://...'      # link on the command line
+  aruba-native-enroll --no-nm              # only fetch certs, skip nmcli
+"""
+import argparse
+import base64
+import json
+import os
+import re
+import secrets
+import shutil
+import string
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+UA = "ArubaOnboard/1.6.0 (Linux)"
+OUT_DIR = os.path.expanduser("~/.aruba-onboard")
+
+
+def die(msg):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def http(url, method="GET", headers=None, body=None):
+    req = urllib.request.Request(
+        url, data=body, method=method, headers={"User-Agent": UA, **(headers or {})}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except urllib.error.URLError as e:
+        die(f"cannot reach {url}: {e.reason} (do you have internet?)")
+
+
+def openssl(*args, input=None):
+    r = subprocess.run(["openssl", *args], input=input, capture_output=True)
+    if r.returncode != 0:
+        die(f"openssl {args[0]} failed: {r.stderr.decode(errors='replace').strip()}")
+    return r.stdout
+
+
+def parse_link(link):
+    q = urllib.parse.parse_qs(urllib.parse.urlsplit(link.strip()).query)
+    if "data" not in q:
+        die("that does not look like an arubadp://.../provision?data=... link")
+    raw = q["data"][0]
+    return json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+
+
+def p7_to_pem(b64_body):
+    """EST returns base64(DER PKCS#7 certs-only); convert to PEM certificates."""
+    der = base64.b64decode(b64_body)
+    return openssl("pkcs7", "-inform", "DER", "-print_certs", input=der).decode()
+
+
+def split_certs(pem):
+    return re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----\n?", pem, re.S)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("link", nargs="?", help="arubadp:// link (default: ~/arubadp-link.txt)")
+    ap.add_argument("--no-nm", action="store_true", help="do not create the NetworkManager profile")
+    ap.add_argument("--access-token-file", help="skip the bootstrap exchange and reuse this access token (debugging)")
+    args = ap.parse_args()
+
+    for tool in ("openssl",) + (() if args.no_nm else ("nmcli",)):
+        if not shutil.which(tool):
+            die(f"'{tool}' not found in PATH")
+
+    link = args.link
+    if not link:
+        p = os.path.expanduser("~/arubadp-link.txt")
+        if not os.path.exists(p):
+            die("no link given and ~/arubadp-link.txt does not exist")
+        link = open(p).read()
+    boot = parse_link(link)
+    cbt, cfg_url = boot["token"], boot["config_endpoint"]
+
+    print("1/6 Fetching endpoints...")
+    st, body = http(cfg_url, headers={"Authorization": f"Bearer {cbt}"})
+    if st != 200:
+        die(f"config endpoint returned HTTP {st}; the link may be expired - get a fresh one from the portal")
+    cfg = json.loads(body)
+
+    print("2/6 Exchanging bootstrap token for access token...")
+    if args.access_token_file:
+        access = open(args.access_token_file).read().strip()
+    else:
+        st, body = http(
+            cfg["token_endpoint"], "POST",
+            {"X-CloudGuest-API-Key": cbt, "Content-Type": "application/json"}, b"{}",
+        )
+        if st != 200:
+            die(f"token exchange returned HTTP {st}: the link is single-use and probably already consumed. "
+                "Get a fresh arubadp:// link from the portal.")
+        access = json.loads(body)["access_token"]
+
+    print("3/6 Downloading network profile...")
+    st, body = http(
+        cfg["passpoint_endpoint"], "POST",
+        {"X-CloudGuest-API-Key": access, "Content-Type": "application/json"}, b"{}",
+    )
+    if st != 200:
+        die(f"passpoint endpoint returned HTTP {st}: {body[:200]!r}")
+    prof = json.loads(body)
+    ssid = prof["ssid"]
+    est = prof["est_endpoint"]
+    est_hdr = {"Authorization": f"Bearer {prof['est_token']}"}
+    print(f"    SSID: {ssid}   user: {prof.get('username')}")
+
+    print("4/6 Generating key + CSR (EC P-384) and enrolling via EST...")
+    st, attrs = http(est + "csrattrs", headers=est_hdr)
+    print(f"    csrattrs: HTTP {st}")
+    with tempfile.TemporaryDirectory() as td:
+        key = os.path.join(td, "key.pem")
+        csr_der = openssl(
+            "req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:secp384r1",
+            "-nodes", "-keyout", key, "-subj", f"/CN={prof.get('username') or 'aruba-onboard'}",
+            "-sha384", "-outform", "DER",
+        )
+        st, body = http(
+            est + "simpleenroll", "POST",
+            {**est_hdr, "Content-Type": "application/pkcs10", "Content-Transfer-Encoding": "base64"},
+            base64.encodebytes(csr_der),
+        )
+        if st != 200:
+            die(f"simpleenroll returned HTTP {st}: {body[:300]!r}")
+        user_pem = split_certs(p7_to_pem(body))[0]
+        key_pem = open(key).read()
+
+        print("5/6 Saving credentials to", OUT_DIR)
+        os.makedirs(OUT_DIR, mode=0o700, exist_ok=True)
+        # no spaces in file names: nmcli splits "<file> <password>" on whitespace
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", ssid).strip("-").lower()
+        ca_path = os.path.join(OUT_DIR, f"{slug}-ca.pem")
+        user_path = os.path.join(OUT_DIR, f"{slug}-user.pem")
+        p12_path = os.path.join(OUT_DIR, f"{slug}-key.p12")
+        alphabet = string.ascii_letters + string.digits
+        password = "".join(secrets.choice(alphabet) for _ in range(32))
+        cert_file = os.path.join(td, "user.pem")
+        open(cert_file, "w").write(user_pem)
+        # root CA(s) the server tells us to trust (profile) + EST CA chain
+        st, cab = http(est + "cacerts", headers=est_hdr)
+        ca_pem = prof.get("server_trust_ca") or ""
+        if st == 200:
+            ca_pem += p7_to_pem(cab)
+        open(ca_path, "w").write(ca_pem)
+        open(user_path, "w").write(user_pem)
+        openssl(
+            "pkcs12", "-export", "-inkey", key, "-in", cert_file, "-certfile", ca_path,
+            "-out", p12_path, "-passout", f"pass:{password}",
+        )
+    for p in (ca_path, user_path, p12_path):
+        os.chmod(p, 0o600)
+    open(os.path.join(OUT_DIR, "profiles.adpdata"), "w").write(
+        json.dumps({k: v for k, v in prof.items() if k not in ("est_token", "server_trust_ca")}, indent=1)
+    )
+    os.chmod(os.path.join(OUT_DIR, "profiles.adpdata"), 0o600)
+
+    subj = openssl("x509", "-in", user_path, "-noout", "-subject", "-enddate").decode().strip()
+    print("    " + subj.replace("\n", "\n    "))
+
+    if args.no_nm:
+        print(f"Done. PKCS#12 password: {password}")
+        return
+
+    print("6/6 Creating NetworkManager connection...")
+    ident = prof.get("recommended_identity") or f"anonymous@{prof['realm']}"
+    iface = subprocess.run(
+        ["nmcli", "-t", "-f", "DEVICE,TYPE", "device", "status"], capture_output=True, text=True
+    ).stdout
+    m = re.search(r"^([^:]+):wifi$", iface, re.M)
+    ifname = m.group(1) if m else "*"
+    subprocess.run(["nmcli", "connection", "delete", ssid], capture_output=True)
+    cmd = [
+        "nmcli", "connection", "add", "type", "wifi", "con-name", ssid, "ifname", ifname, "ssid", ssid,
+        "wifi-sec.key-mgmt", "wpa-eap", "802-1x.eap", "tls", "802-1x.identity", ident,
+        "802-1x.ca-cert", ca_path, "802-1x.client-cert", user_path,
+        "802-1x.private-key", p12_path, "802-1x.private-key-password", password,
+        "802-1x.phase1-auth-flags", "1", "connection.autoconnect", "no",
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"nmcli failed: {r.stderr.strip()}")
+    print(f'Done. Connect with:  nmcli connection up "{ssid}"')
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,134 @@
+openapi: 3.0.3
+info:
+  title: Aruba CloudGuest client onboarding API (unofficial, reverse-engineered)
+  version: 0.1.0
+  description: |
+    Contract used by the HPE Aruba Onboard client to enroll a device for a CloudGuest "Passpoint"
+    (EAP-TLS) network. Derived from the Linux client and verified live; not an official spec and it
+    may change without notice. Hosts and scope ids come from the `arubadp://` link.
+servers:
+  - url: https://uswest4.cloudguest.central.arubanetworks.com
+    description: Portal / API host (taken from the link)
+  - url: https://ca-uswest4.cloudguest.central.arubanetworks.com
+    description: EST CA host (taken from `est_endpoint`)
+components:
+  securitySchemes:
+    bootstrapBearer:
+      type: http
+      scheme: bearer
+      description: Single-use bootstrap token (`CBT1.…`) from the arubadp link.
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-CloudGuest-API-Key
+      description: Bootstrap token (for the token exchange) or the access token (everything else).
+    estBearer:
+      type: http
+      scheme: bearer
+      description: '`est_token` from the passpoint profile.'
+  schemas:
+    Endpoints:
+      type: object
+      properties:
+        config_endpoint: {type: string, format: uri}
+        token_endpoint: {type: string, format: uri}
+        passpoint_endpoint: {type: string, format: uri}
+        userinfo_endpoint: {type: string, format: uri}
+        events_endpoint: {type: string, format: uri}
+        self_service_endpoint: {type: string, format: uri}
+        est_endpoint: {type: string, format: uri, description: EST base URL, ends with "/"}
+        reauth_url: {type: string, format: uri}
+    AccessToken:
+      type: object
+      required: [access_token]
+      properties:
+        access_token: {type: string}
+    UserInfo:
+      type: object
+      properties:
+        organization_name: {type: string}
+        username: {type: string}
+        display_name: {type: string}
+    PasspointProfile:
+      type: object
+      properties:
+        organization_name: {type: string}
+        ssid: {type: string}
+        friendly_name: {type: string}
+        domain_name: {type: string}
+        realm: {type: string}
+        auth_method: {type: string, example: eap_tls}
+        recommended_identity: {type: string, description: Outer (anonymous) 802.1X identity}
+        username: {type: string}
+        password: {type: string, nullable: true}
+        server_trust_ca: {type: string, description: PEM CA to trust for the RADIUS server}
+        est_endpoint: {type: string, format: uri}
+        est_token: {type: string}
+        dual_wired_network: {type: boolean}
+        refresh_at: {type: string, format: date-time}
+paths:
+  /portal/scope.cust-{scope}/cda-user-portal/client/config:
+    get:
+      summary: Discover endpoints
+      parameters:
+        - {name: scope, in: path, required: true, schema: {type: string}}
+      security: [{bootstrapBearer: []}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/Endpoints'}}}}
+        '302': {description: Missing/invalid token, redirects to portal login}
+  /api/v1/scope.cust-{scope}/portals/{portal}/client/token:
+    post:
+      summary: Exchange the single-use bootstrap token for an access token
+      parameters:
+        - {name: scope, in: path, required: true, schema: {type: string}}
+        - {name: portal, in: path, required: true, schema: {type: string, format: uuid}}
+      security: [{apiKey: []}]
+      requestBody:
+        content: {application/json: {schema: {type: object}}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/AccessToken'}}}}
+        '401': {description: Token invalid or already used}
+  /api/v1/scope.cust-{scope}/portals/{portal}/client/userinfo:
+    get:
+      summary: Account the link was issued for
+      parameters:
+        - {name: scope, in: path, required: true, schema: {type: string}}
+        - {name: portal, in: path, required: true, schema: {type: string, format: uuid}}
+      security: [{apiKey: []}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/UserInfo'}}}}
+  /api/v1/scope.cust-{scope}/portals/{portal}/client/passpoint:
+    post:
+      summary: Network profile and EST credentials
+      parameters:
+        - {name: scope, in: path, required: true, schema: {type: string}}
+        - {name: portal, in: path, required: true, schema: {type: string, format: uuid}}
+      security: [{apiKey: []}]
+      requestBody:
+        content: {application/json: {schema: {type: object}}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/PasspointProfile'}}}}
+  /.well-known/est/{estId}/csrattrs:
+    get:
+      summary: EST CSR attributes (RFC 7030 §4.5)
+      parameters: [{name: estId, in: path, required: true, schema: {type: string, format: uuid}}]
+      security: [{estBearer: []}]
+      responses:
+        '200': {description: base64 DER (EC P-384, ECDSA-SHA384), content: {application/csrattrs: {schema: {type: string}}}}
+  /.well-known/est/{estId}/cacerts:
+    get:
+      summary: EST CA certificates (RFC 7030 §4.1)
+      parameters: [{name: estId, in: path, required: true, schema: {type: string, format: uuid}}]
+      security: [{estBearer: []}]
+      responses:
+        '200': {description: base64 DER certs-only PKCS#7, content: {application/pkcs7-mime: {schema: {type: string}}}}
+  /.well-known/est/{estId}/simpleenroll:
+    post:
+      summary: Enroll a client certificate (RFC 7030 §4.2)
+      parameters: [{name: estId, in: path, required: true, schema: {type: string, format: uuid}}]
+      security: [{estBearer: []}]
+      requestBody:
+        required: true
+        content: {application/pkcs10: {schema: {type: string, description: base64 DER PKCS#10 CSR}}}
+      responses:
+        '200': {description: base64 DER PKCS#7 with the issued certificate, content: {application/pkcs7-mime: {schema: {type: string}}}}
