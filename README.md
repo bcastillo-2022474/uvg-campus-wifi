@@ -8,7 +8,7 @@ aarch64, Apple Silicon).
 ## Use it
 
 ```bash
-git clone <this repo> && cd uvg-aruba-onboard-native
+git clone https://github.com/bcastillo-2022474/uvg-campus-wifi && cd uvg-campus-wifi
 ./install.sh
 ```
 
@@ -52,6 +52,10 @@ Otherwise get the link yourself, save it to `~/arubadp-link.txt` and run `aruba-
 | Network not visible | Not in range of campus APs; enrollment still works anywhere |
 
 How it works: [docs/PROTOCOL.md](docs/PROTOCOL.md). Machine-readable contract: [docs/openapi.yaml](docs/openapi.yaml).
+
+## Related
+
+[denn1s/archlinux-aruba-onboard-uvg](https://github.com/denn1s/archlinux-aruba-onboard-uvg) packages HPE's own x86-64 client for Arch Linux. This repo replaces that client with a native one, so it also works on ARM and other distros.
 
 ## Disclaimer
 
